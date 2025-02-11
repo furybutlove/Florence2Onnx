@@ -192,7 +192,4 @@ if __name__ == '__main__':
         providers=["CUDAExecutionProvider"],
         warmup_iterations=10
     )
-    st = time.time()
-    for _ in range(50):
-        model.infer_from_image("./car.jpg", prompt="<MORE_DETAILED_CAPTION>", max_new_tokens=1024)
-    print("Total Time: {:.4f} seconds".format(time.time() - st))
+    model.infer_from_image("./car.jpg", prompt="<MORE_DETAILED_CAPTION>", max_new_tokens=1024)
