@@ -8,72 +8,99 @@ import onnxruntime as ort
 from transformers import AutoProcessor
 
 
-# WEIGHT FILES CAN BE DOWNLOADED FROM HERE: https://huggingface.co/onnx-community/Florence-2-base-ft/tree/main/onnx
 class Florence2OnnxModel:
     def __init__(
         self,
         providers: List[str] = None,
         warmup_iterations: int = 10,
+        verbose: bool = False,
     ):
-
-        # Change working directory to the provided ONNX directory
+        # Set the working directory to the current ONNX model directory.
         onnx_dir: str = os.path.dirname(os.path.abspath(__file__))
         os.chdir(onnx_dir)
 
         processor_dir: str = os.path.join(onnx_dir, "processor_files")
 
-
         if providers is None:
             providers = ["CPUExecutionProvider"]
 
+        # Create custom session options.
+        # If verbose is False, we set a higher log severity level (3) to suppress warnings.
+        # When verbose is True, we lower the threshold to see detailed logs.
+        session_options = ort.SessionOptions()
+        session_options.log_severity_level = 1 if verbose else 3
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+
+        # Optionally, you could enforce memory pattern optimizations (enabled by default)
+        session_options.enable_mem_pattern = True
+        session_options.enable_cpu_mem_arena = True
+
+        # Initialize ONNX sessions with the custom session options.
         self.vision_encoder = ort.InferenceSession(
             os.path.join(onnx_dir, "weight_files/vision_encoder_q4f16.onnx"),
             providers=providers,
+            sess_options=session_options,
         )
         self.text_embed = ort.InferenceSession(
             os.path.join(onnx_dir, "weight_files/embed_tokens_q4f16.onnx"),
             providers=providers,
+            sess_options=session_options,
         )
         self.encoder = ort.InferenceSession(
             os.path.join(onnx_dir, "weight_files/encoder_model_q4f16.onnx"),
             providers=providers,
+            sess_options=session_options,
         )
         self.decoder_prefill = ort.InferenceSession(
             os.path.join(onnx_dir, "weight_files/decoder_model_q4f16.onnx"),
             providers=providers,
+            sess_options=session_options,
         )
         self.decoder_decode = ort.InferenceSession(
             os.path.join(onnx_dir, "weight_files/decoder_model_merged_q4.onnx"),
             providers=providers,
+            sess_options=session_options,
         )
 
-        self.processor = AutoProcessor.from_pretrained(processor_dir, trust_remote_code=True)
+        self.processor = AutoProcessor.from_pretrained(
+            processor_dir, trust_remote_code=True
+        )
 
         self._warmup(iterations=warmup_iterations)
 
     def _warmup(self, iterations: int = 10) -> None:
         dummy_image = Image.new("RGB", (384, 384))
         dummy_prompt = "<MORE_DETAILED_CAPTION>"
-        dummy_inputs = self.processor(text=dummy_prompt, images=dummy_image, return_tensors="np")
+        dummy_inputs = self.processor(
+            text=dummy_prompt, images=dummy_image, return_tensors="np"
+        )
 
         for _ in range(iterations):
-            _ = self.vision_encoder.run(None, {"pixel_values": dummy_inputs["pixel_values"]})
+            _ = self.vision_encoder.run(
+                None, {"pixel_values": dummy_inputs["pixel_values"]}
+            )
             _ = self.text_embed.run(None, {"input_ids": dummy_inputs["input_ids"]})
-            _ = self.encoder.run(None, {
-                "inputs_embeds": np.zeros((1, 10, 768), dtype=np.float32),
-                "attention_mask": np.zeros((1, 10), dtype=np.int64)
-            })
+            _ = self.encoder.run(
+                None,
+                {
+                    "inputs_embeds": np.zeros((1, 10, 768), dtype=np.float32),
+                    "attention_mask": np.zeros((1, 10), dtype=np.int64),
+                },
+            )
 
     def generate_caption(
         self,
         image_path: str,
         prompt: str = "<MORE_DETAILED_CAPTION>",
-        max_new_tokens: int = 1024
+        max_new_tokens: int = 1024,
     ) -> (str, float):
 
-
         image = Image.open(image_path)
-        inputs = self.processor(text=prompt, images=image, return_tensors="np", do_resize=True)
+        inputs = self.processor(
+            text=prompt, images=image, return_tensors="np", do_resize=True
+        )
 
         start_time = time.time()
 
@@ -81,24 +108,25 @@ class Florence2OnnxModel:
             None, {"pixel_values": inputs["pixel_values"]}
         )[0]
 
-        inputs_embeds = self.text_embed.run(
-            None, {"input_ids": inputs["input_ids"]}
-        )[0]
+        inputs_embeds = self.text_embed.run(None, {"input_ids": inputs["input_ids"]})[0]
 
         batch_size, image_token_length = image_features.shape[:-1]
         image_attention_mask = np.ones((batch_size, image_token_length), dtype=np.int64)
         task_prefix_embeds = inputs_embeds
-        task_prefix_attention_mask = np.ones((batch_size, task_prefix_embeds.shape[1]), dtype=np.int64)
+        task_prefix_attention_mask = np.ones(
+            (batch_size, task_prefix_embeds.shape[1]), dtype=np.int64
+        )
 
         if task_prefix_attention_mask.ndim == 3:
             task_prefix_attention_mask = task_prefix_attention_mask[:, 0]
 
         inputs_embeds = np.concatenate([image_features, task_prefix_embeds], axis=1)
-        attention_mask = np.concatenate([image_attention_mask, task_prefix_attention_mask], axis=1)
+        attention_mask = np.concatenate(
+            [image_attention_mask, task_prefix_attention_mask], axis=1
+        )
 
         encoder_hidden_states = self.encoder.run(
-            None,
-            {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
+            None, {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
         )[0]
 
         decoder_outs = self.decoder_prefill.run(
@@ -106,8 +134,8 @@ class Florence2OnnxModel:
             {
                 "inputs_embeds": inputs_embeds[:, -1:],
                 "encoder_hidden_states": encoder_hidden_states,
-                "encoder_attention_mask": attention_mask
-            }
+                "encoder_attention_mask": attention_mask,
+            },
         )
         encoder_kv = decoder_outs[1:]
 
@@ -120,13 +148,12 @@ class Florence2OnnxModel:
             next_token = int(np.argmax(next_token_logits, axis=-1)[0])
             generated_tokens.append(next_token)
 
-            # Break if the EOS token (assumed to be token id 2) is generated.
+            # Stop if the end-of-sequence token (assumed token id 2) is generated.
             if next_token == 2:
                 break
 
             next_input_embeds = self.text_embed.run(
-                None,
-                {"input_ids": np.array([[next_token]], dtype=np.int64)}
+                None, {"input_ids": np.array([[next_token]], dtype=np.int64)}
             )[0]
 
             decoder_outs = self.decoder_decode.run(
@@ -160,7 +187,7 @@ class Florence2OnnxModel:
                     "past_key_values.5.decoder.value": decoder_kv[21],
                     "past_key_values.5.encoder.key": encoder_kv[22],
                     "past_key_values.5.encoder.value": encoder_kv[23],
-                }
+                },
             )
 
         end_time = time.time()
@@ -179,17 +206,22 @@ class Florence2OnnxModel:
         self,
         image_path: str,
         prompt: str = "<MORE_DETAILED_CAPTION>",
-        max_new_tokens: int = 1024
+        max_new_tokens: int = 1024,
     ) -> None:
-
-        parsed_answer, inference_time = self.generate_caption(image_path, prompt, max_new_tokens)
+        parsed_answer, inference_time = self.generate_caption(
+            image_path, prompt, max_new_tokens
+        )
         print(f"Inference Time: {inference_time:.4f} seconds")
         print("Answer:", parsed_answer)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    # Set verbose=True to see detailed logs; otherwise warnings are suppressed.
     model = Florence2OnnxModel(
-        providers=["CUDAExecutionProvider"],
-        warmup_iterations=10
+        providers=["CUDAExecutionProvider"], warmup_iterations=10, verbose=False
     )
-    model.infer_from_image("./car.jpg", prompt="<MORE_DETAILED_CAPTION>", max_new_tokens=1024)
+    model.infer_from_image(
+        "/home/ubuntu/git/star-ai/notebooks/inpaint/test.jpg",
+        prompt="<MORE_DETAILED_CAPTION>",
+        max_new_tokens=1024,
+    )
